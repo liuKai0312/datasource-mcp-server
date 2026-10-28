@@ -460,12 +460,12 @@ logging:
 
 ## 可用工具列表
 
-> v3 共提供 28 个工具。工具名统一为 snake_case；旧 camelCase/v2 名称不再注册。
+> v3 共提供 32 个工具。工具名统一为 snake_case；旧 camelCase/v2 名称不再注册。
 
 | 类型 | 只读工具 | 写工具 |
 | ---- | -------- | ------ |
 | 通用/关系型 | `datasource_list`、`db_list_schemas`、`db_list_tables`、`db_describe_table`、`db_query`、`db_sample_rows`、`db_table_statistics`、`db_column_statistics` | `db_insert`、`db_update`、`db_delete`、`db_execute_sql` |
-| Elasticsearch | `es_list_indices`、`es_get_mapping`、`es_count_documents`、`es_search` | `es_index_document`、`es_delete_document` |
+| Elasticsearch | `es_list_indices`、`es_get_mapping`、`es_count_documents`、`es_search`、`es_get_export_status`、`es_list_exports` | `es_start_export`、`es_cancel_export`、`es_index_document`、`es_delete_document` |
 | Redis | `redis_scan_keys`、`redis_get_key_info`、`redis_get_value` | `redis_set_value`、`redis_delete_key`、`redis_set_expiry` |
 | Kafka | `kafka_list_topics`、`kafka_describe_topic`、`kafka_list_consumer_groups`、`kafka_peek_messages` | 无 |
 
@@ -492,6 +492,18 @@ logging:
 关系型旧名称统一映射为 `datasource_list` 或 `db_*`；例如 `listDatasources/list_datasources` → `datasource_list`、`executeQuery/execute_query` → `db_query`、`executeDdl/execute_ddl` → `db_execute_sql`。ES、Redis、Kafka 工具按原含义转换为对应的 snake_case 名称，例如 `redisGetKey` → `redis_get_value`、`kafkaPeekMessages` → `kafka_peek_messages`。
 
 Redis 集合和值采用 SCAN 或区间分页，不再全量执行 `SMEMBERS`、`HGETALL`、`LRANGE 0 -1`。Kafka 抓取仍使用 `assign()`、`seek()`、随机 group id 且不提交 offset。
+
+### Elasticsearch 大批量导出
+
+`es_start_export` 在后台使用 PIT + `search_after` 流式读取，按配置行数切分为 NDJSON 文件。每行固定包含 `_index`、`_id` 和完整 `_source`；任务目录同时生成 `manifest.json`，记录查询条件、总行数、文件大小和 SHA-256。调用方不能传入文件路径，所有文件只能写入 `mcp.elasticsearch-export.directory`。
+
+典型调用顺序：
+
+1. 调用 `es_start_export`，传入 `datasource`、`index` 和可选 `query`。
+2. 使用返回的 `export_id` 轮询 `es_get_export_status`，直到 `status` 为 `completed`、`failed` 或 `cancelled`。
+3. HTTP 模式下，通过 `GET /api/es-exports/{export_id}/files/{file_name}` 下载 manifest 和数据分片；若配置了 Web 访问令牌，请携带 `X-Access-Token` 请求头。
+
+导出任务只读取 Elasticsearch，但会在 MCP Server 所在主机创建文件，因此 `es_start_export` 和 `es_cancel_export` 的工具注解均声明为非只读、非破坏性且非幂等。中断或失败时 `.part` 文件与 manifest 会保留用于诊断，服务不会自动删除历史导出。
 
 ## 安全机制
 
@@ -555,9 +567,40 @@ Redis 集合和值采用 SCAN 或区间分页，不再全量执行 `SMEMBERS`、
 
 所有工具都显式声明 MCP Tool Annotations。只读工具为 `readOnlyHint=true`，写工具为 `readOnlyHint=false`、`destructiveHint=true`。
 
-MCP 规范建议（**SHOULD**）客户端对敏感操作提示用户确认，但协议不强制具体交互模型。本服务无法验证客户端是否展示过确认框；收到合法工具调用后会立即执行。因此 annotations、描述和 `warnings` 都只是风险信号，不是服务端确认机制。
+服务端提供可开关的 SQL 确认模式。HTTP 模式默认开启，在管理页面「SQL 执行确认」面板切换；开关写入本机 `settings.json`，重启后优先恢复已保存的设置。`db_insert`、`db_update`、`db_delete` 和 `db_execute_sql` 每次调用都独立等待人工确认，页面每 2 秒检查队列并弹窗，展示客户端、数据源、完整 SQL 和截止时间。批准后执行一次，拒绝、超时或等待线程中断均不执行。只读限制和原有 SQL 安全校验仍然生效。通用 SQL 工具按可修改工具处理，即使传入 SELECT 也需要确认。ES、Redis 的写操作不在本次 SQL 确认范围内。
 
-特别注意：`db_update`、`db_delete` 以及 `db_execute_sql` 中无 WHERE 的 UPDATE/DELETE 会记录 WARN 审计日志并在结果中返回 `unsafe_scope=true`，但仍然执行。生产环境必须依靠只读数据源和最小权限数据库账号限制破坏面。
+默认等待 60 秒（可配 1–600 秒），最多 32 个并发待确认请求。请保持管理页面打开，并将 MCP 客户端请求超时设为大于确认等待时间加 SQL 执行时间。关闭模式只影响新请求，已有待确认请求不会自动获批；重启会清空待确认队列。纯 stdio 没有管理页面，随附配置将其默认设为关闭；若该目录已有保存的开关状态，以保存状态为准。需要启用人工确认时建议使用 HTTP 模式。
+
+点击「开启浏览器通知」并授予站点通知权限后，新待确认 SQL 还会发送系统通知；点击通知返回页面人工处理。通知中不展示 SQL 或业务数据，同一请求在当前页面不会重复提醒，处理或过期后在下一轮成功轮询时关闭通知。通知开关按当前浏览器保存，与服务端 SQL 确认开关独立。需要 HTTPS 或 localhost 安全上下文；使用内网 IP 的普通 HTTP 地址时仍可使用页面弹窗，但无法开启系统通知。需要保持页面打开，浏览器后台节流、休眠或系统勿扰可能影响及时性，关闭页面后不会推送通知。
+
+```yaml
+mcp:
+  activity:
+    directory: ./datasource-mcp/activity
+    confirmation-enabled: true
+    confirmation-timeout-seconds: 60
+    max-pending: 32
+    retention-days: 30
+```
+
+### 本机调用日志
+
+所有已注册 MCP 工具调用完成后，写入 `${mcp.activity.directory}/calls/YYYY-MM-DD.jsonl`（按服务端本地日期）。日志包括请求 ID、客户端在 MCP 初始化时上报的名称与版本、开始/完成时间、实际解析的数据源名、工具、总耗时、成功/失败、请求参数和实际返回给客户端的响应。未提供客户端信息时记为 `unknown`。客户端名称来自协议上报，不能作为身份凭证。响应保留现有工具输出大小限制，不额外查询数据库或展开导出文件内容。
+
+管理页面「MCP 调用日志」支持按日期分页查看以及简略/详细切换；详细模式显示 SQL/请求参数和响应，简略接口不返回这两项。日志默认保留 30 天，在写入当天首条日志时清理过期文件。日志写入失败会记录服务端错误，不将已执行的 SQL 误报为执行失败。日志包含实际 SQL 和业务响应，目录应按业务数据要求管理磁盘容量及访问权限。
+
+HTTP API（复用现有 `X-Access-Token` 校验）：
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/activity/logs?date=2026-10-28&page=0&size=20&detail=false` | 日期日志，从最新记录开始分页；size 为 1–100 |
+| `GET /api/activity/confirmation` | 开关状态及待确认列表 |
+| `PUT /api/activity/confirmation`，`{"enabled":true}` | 保存确认模式 |
+| `POST /api/activity/confirmation/{id}`，`{"approved":true}` | 批准指定请求；false 为拒绝，重复/过期返回 409 |
+
+等待失败时 MCP 返回稳定错误码 `SQL_REJECTED`、`APPROVAL_TIMEOUT`、`APPROVAL_CANCELLED` 或 `APPROVAL_QUEUE_FULL`，同时写入调用日志。
+
+特别注意：`db_update`、`db_delete` 以及 `db_execute_sql` 中无 WHERE 的 UPDATE/DELETE 会记录 WARN 审计日志并在结果中返回 `unsafe_scope=true`，在确认模式开启时需先批准，关闭时直接执行。生产环境应配合只读数据源和最小权限数据库账号限制破坏面。
 
 ## 扩展指南
 
@@ -738,4 +781,4 @@ dameng-mcp-server/
    - MySQL：`jdbc:mysql://host:3306/db?useSSL=false&characterEncoding=UTF-8&serverTimezone=UTC`
    - 达梦/Oracle：默认 UTF-8，通常无需额外配置
 
-7. **写操作风险**：写操作会实际修改数据库数据和结构，客户端不一定展示确认框。建议先在非生产环境验证 SQL，并使用只读或最小权限账号。`db_execute_sql` 可执行 DROP/TRUNCATE 等不可逆操作。
+7. **写操作风险**：写操作会实际修改数据库数据和结构，HTTP 模式可通过管理页面启用服务端 SQL 确认。建议先在非生产环境验证 SQL，并使用只读或最小权限账号。`db_execute_sql` 可执行 DROP/TRUNCATE 等不可逆操作。

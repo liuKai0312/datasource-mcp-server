@@ -12,6 +12,7 @@ import com.dameng.mcp.service.DatabaseQueryService;
 import com.dameng.mcp.service.DatabaseStatisticsService;
 import com.dameng.mcp.service.DatabaseWriteService;
 import com.dameng.mcp.service.ElasticsearchToolService;
+import com.dameng.mcp.service.ElasticsearchExportService;
 import com.dameng.mcp.service.KafkaToolService;
 import com.dameng.mcp.service.RedisToolService;
 import com.dameng.mcp.util.CursorCodec;
@@ -35,7 +36,7 @@ import static com.dameng.mcp.config.McpToolSpecFactory.objectData;
 import static com.dameng.mcp.config.McpToolSpecFactory.property;
 
 @Configuration
-@EnableConfigurationProperties(McpToolProperties.class)
+@EnableConfigurationProperties({McpToolProperties.class, ElasticsearchExportProperties.class, McpActivityProperties.class})
 public class McpToolConfig {
 
     private static final Map<String, Object> STRING_SCHEMA = Map.of("type", "string");
@@ -59,6 +60,17 @@ public class McpToolConfig {
             "field", STRING_SCHEMA, "type", STRING_SCHEMA), "field", "type");
     private static final Map<String, Object> ES_HIT_SCHEMA = objectData(props(
             "id", STRING_SCHEMA, "score", nullable(NUMBER_SCHEMA), "source", Map.of()), "id", "source");
+    private static final Map<String, Object> ES_EXPORT_SCHEMA = objectData(props(
+            "export_id", STRING_SCHEMA, "status", STRING_SCHEMA, "datasource", STRING_SCHEMA,
+            "index", STRING_SCHEMA, "page_size", INTEGER_SCHEMA, "max_rows", INTEGER_SCHEMA,
+            "total_hits", nullable(INTEGER_SCHEMA), "rows_written", INTEGER_SCHEMA,
+            "bytes_written", INTEGER_SCHEMA, "file_count", INTEGER_SCHEMA,
+            "files", arrayOf(STRING_SCHEMA), "truncated", BOOLEAN_SCHEMA,
+            "cancel_requested", BOOLEAN_SCHEMA, "created_at", STRING_SCHEMA,
+            "started_at", nullable(STRING_SCHEMA), "completed_at", nullable(STRING_SCHEMA),
+            "output_directory", STRING_SCHEMA, "manifest_path", STRING_SCHEMA,
+            "download_path", STRING_SCHEMA, "error", nullable(STRING_SCHEMA)),
+            "export_id", "status", "datasource", "index", "rows_written", "file_count");
     private static final Map<String, Object> KAFKA_GROUP_SCHEMA = objectData(props(
             "groupId", STRING_SCHEMA, "state", STRING_SCHEMA, "members", INTEGER_SCHEMA,
             "totalLag", INTEGER_SCHEMA), "groupId", "state", "members", "totalLag");
@@ -72,8 +84,10 @@ public class McpToolConfig {
             "partition", "offset", "timestamp");
 
     @Bean
-    public McpToolSpecFactory mcpToolSpecFactory(ObjectMapper objectMapper, McpToolProperties properties) {
-        return new McpToolSpecFactory(objectMapper, properties);
+    public McpToolSpecFactory mcpToolSpecFactory(ObjectMapper objectMapper, McpToolProperties properties,
+            com.dameng.mcp.service.McpCallLogService logs, com.dameng.mcp.service.SqlApprovalService approvals,
+            com.dameng.mcp.adapter.DataSourceRegistry registry, com.dameng.mcp.security.SqlSecurityValidator validator) {
+        return new McpToolSpecFactory(objectMapper, properties, logs, approvals, registry, validator);
     }
 
     @Bean
@@ -81,11 +95,12 @@ public class McpToolConfig {
             McpToolSpecFactory factory, McpToolProperties properties, ObjectMapper objectMapper,
             DatabaseMetadataService metadata, DatabaseQueryService query,
             DatabaseStatisticsService statistics, DatabaseWriteService write,
-            ElasticsearchToolService elasticsearch, RedisToolService redis, KafkaToolService kafka) {
+            ElasticsearchToolService elasticsearch, ElasticsearchExportService elasticsearchExport,
+            RedisToolService redis, KafkaToolService kafka) {
         List<McpServerFeatures.SyncToolSpecification> tools = new ArrayList<>();
         addDatabaseReadTools(tools, factory, properties, objectMapper, metadata, query, statistics);
         addDatabaseWriteTools(tools, factory, write);
-        addElasticsearchTools(tools, factory, properties, objectMapper, elasticsearch);
+        addElasticsearchTools(tools, factory, properties, objectMapper, elasticsearch, elasticsearchExport);
         addRedisTools(tools, factory, properties, redis);
         addKafkaTools(tools, factory, properties, objectMapper, kafka);
         return List.copyOf(tools);
@@ -204,7 +219,7 @@ public class McpToolConfig {
         tools.add(writeTool(factory, "db_update", "Update database rows", "UPDATE", write));
         tools.add(writeTool(factory, "db_delete", "Delete database rows", "DELETE", write));
         tools.add(factory.create("db_execute_sql", "Execute arbitrary SQL",
-                "Execute one arbitrary SQL statement on a writable relational data source. This is destructive and server-side user confirmation is not enforced.",
+                "Execute one arbitrary SQL statement on a writable relational data source. When SQL confirmation mode is enabled, execution waits for manual approval on the server management page; rejection or timeout cancels execution.",
                 sqlInput(), objectData(props("datasource", STRING_SCHEMA, "statement_type", STRING_SCHEMA,
                         "unsafe_scope", BOOLEAN_SCHEMA), "datasource", "statement_type", "unsafe_scope"),
                 false, args -> {
@@ -220,7 +235,7 @@ public class McpToolConfig {
     private McpServerFeatures.SyncToolSpecification writeTool(
             McpToolSpecFactory factory, String name, String title, String operation, DatabaseWriteService write) {
         return factory.create(name, title,
-                "Execute one " + operation + " statement on a writable relational data source. Statements without WHERE are warned but not blocked.",
+                "Execute one " + operation + " statement on a writable relational data source. When confirmation mode is enabled, manual approval on the server management page is required. Statements without WHERE are warned but not blocked.",
                 sqlInput(), objectData(props("datasource", STRING_SCHEMA, "operation", STRING_SCHEMA,
                         "affected_rows", INTEGER_SCHEMA, "unsafe_scope", BOOLEAN_SCHEMA),
                         "datasource", "operation", "affected_rows", "unsafe_scope"), false, args -> {
@@ -235,7 +250,8 @@ public class McpToolConfig {
 
     private void addElasticsearchTools(List<McpServerFeatures.SyncToolSpecification> tools,
                                        McpToolSpecFactory factory, McpToolProperties properties,
-                                       ObjectMapper mapper, ElasticsearchToolService service) {
+                                       ObjectMapper mapper, ElasticsearchToolService service,
+                                       ElasticsearchExportService exportService) {
         tools.add(factory.create("es_list_indices", "List Elasticsearch indices",
                 "List indices with health, status, document count and storage size. Results are paginated.",
                 pagedDatasourceInput("Elasticsearch"), arrayData("items", OPEN_OBJECT_SCHEMA), true, args -> {
@@ -293,6 +309,33 @@ public class McpToolConfig {
                             "has_more", hasMore, "next_cursor",
                             hasMore ? CursorCodec.encode(Integer.toString(offset + hits.size())) : null));
                 }));
+        tools.add(factory.create("es_start_export", "Start Elasticsearch export",
+                "Start an asynchronous PIT/search_after export to server-managed NDJSON files. "
+                        + "The exporter always includes _index, _id and the complete _source.",
+                inputSchema(props("datasource", stringProperty("Elasticsearch data source name; omit for default"),
+                        "index", stringProperty("Index name or a restricted wildcard expression"),
+                        "query", stringProperty("Optional Query DSL JSON body; pagination and sort are controlled by the exporter"),
+                        "page_size", property("integer", "Documents fetched per Elasticsearch request"),
+                        "max_rows", property("integer", "Maximum documents to export, bounded by server configuration")), "index"),
+                ES_EXPORT_SCHEMA, false, false, false, true, args -> ok(exportService.start(
+                        stringArg(args, "datasource"), requiredString(args, "index"), stringArg(args, "query"),
+                        intArg(args, "page_size", null), longArg(args, "max_rows", null)), Map.of())));
+        tools.add(factory.create("es_get_export_status", "Get Elasticsearch export status",
+                "Return progress, output file names, checksums manifest location and any export error.",
+                inputSchema(props("export_id", stringProperty("Export task identifier")), "export_id"),
+                ES_EXPORT_SCHEMA, true, args -> ok(exportService.status(requiredString(args, "export_id")), Map.of())));
+        tools.add(factory.create("es_list_exports", "List Elasticsearch exports",
+                "List recent export tasks from the current server process.",
+                inputSchema(props("limit", property("integer", "Maximum tasks to return; default 20, maximum 100"))),
+                objectData(props("items", arrayOf(ES_EXPORT_SCHEMA)), "items"), true, args -> {
+                    List<Map<String, Object>> items = exportService.list(intArg(args, "limit", 20));
+                    return ok(map("items", items), map("returned_count", items.size()));
+                }));
+        tools.add(factory.create("es_cancel_export", "Cancel Elasticsearch export",
+                "Request cancellation of a queued or running export. Completed files and the manifest are retained.",
+                inputSchema(props("export_id", stringProperty("Export task identifier")), "export_id"),
+                ES_EXPORT_SCHEMA, false, false, false, true,
+                args -> ok(exportService.cancel(requiredString(args, "export_id")), Map.of())));
         tools.add(factory.create("es_index_document", "Index Elasticsearch document",
                 "Create or replace an Elasticsearch document on a writable data source.",
                 inputSchema(props("datasource", stringProperty("Elasticsearch data source name; omit for default"),
@@ -540,6 +583,21 @@ public class McpToolConfig {
         }
         try {
             return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(name + " 必须是整数");
+        }
+    }
+
+    private static Long longArg(Map<String, Object> args, String name, Long defaultValue) {
+        Object value = args.get(name);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(name + " 必须是整数");
         }

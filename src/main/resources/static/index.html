@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dameng MCP Server - 数据源管理</title>
+    <title>Dameng MCP Server - 管理控制台</title>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -58,6 +58,19 @@
         code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
         .token-box { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
         .token-box input { max-width: 320px; }
+        .activity-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:16px; }
+        .activity-toolbar input, .activity-toolbar select { width:auto; }
+        .activity-toolbar label { margin:0; display:flex; align-items:center; gap:7px; }
+        .activity-toolbar input[type=checkbox] { width:auto; }
+        .activity-note { color:#64748b; font-size:13px; line-height:1.7; }
+        .activity-scroll { overflow-x:auto; }
+        .activity-scroll td { vertical-align:top; overflow-wrap:anywhere; max-width:300px; }
+        .activity-pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:320px; overflow:auto; background:#142033; color:#dce7f5; padding:14px; border-radius:6px; font:12px/1.7 Menlo,monospace; }
+        .pending-item { border:1px solid #edcf8f; border-left:4px solid #ca8a04; padding:14px; margin:12px 0; border-radius:6px; background:#fffdf6; }
+        .activity-status { min-height:22px; color:#b91c1c; font-size:13px; }
+        dialog { border:0; border-radius:12px; width:min(720px,94vw); max-height:85vh; padding:24px; box-shadow:0 20px 80px #0004; }
+        dialog::backdrop { background:#14203388; }
+        dialog h2 { margin-top:0; }
     </style>
 </head>
 <body>
@@ -81,6 +94,46 @@
         </div>
         <div class="hint">令牌通过请求头 <code>X-Access-Token</code> 发送，并保存在当前浏览器本地。修改后点击「应用并刷新」重新加载列表；未配置服务端令牌时可留空。</div>
     </div>
+
+    <div class="card" id="sqlConfirmation">
+        <h2>SQL 执行确认 <span id="pendingBadge" class="tag tag-builtin">连接中</span></h2>
+        <div class="activity-toolbar">
+            <label><input type="checkbox" id="confirmationMode" disabled onchange="changeConfirmationMode()">修改 SQL 执行前需手动确认</label>
+            <button class="btn-ghost" onclick="pollConfirmation()">刷新待确认请求</button>
+            <button class="btn-ghost" id="browserNotificationButton">开启浏览器通知</button>
+        </div>
+        <p id="browserNotificationStatus" class="activity-note" role="status"></p>
+        <p class="activity-note">开启后，INSERT / UPDATE / DELETE 及通用 SQL 将等待人工批准。拒绝或超时均不执行。关闭后新请求直接执行，已有待确认请求仍需处理。请保持本页面打开，并将客户端调用超时设为大于服务端确认等待时间。</p>
+        <div id="approvalStatus" class="activity-status" role="status"></div>
+        <div id="pendingRequests" aria-live="polite"></div>
+    </div>
+
+    <div class="card" id="callLogs">
+        <h2>MCP 调用日志</h2>
+        <div class="activity-toolbar">
+            <label>日期 <input type="date" id="logDate" onchange="loadLogs(true)"></label>
+            <label>展示 <select id="logView" onchange="loadLogs(true)"><option value="summary">简略</option><option value="detail">详细 · 请求与响应</option></select></label>
+            <button class="btn-ghost" onclick="loadLogs(true)">刷新日志</button>
+        </div>
+        <p class="activity-note">调用完成后写入本机文件，包含客户端、数据源、执行结果与耗时；详细视图显示请求参数（含 SQL）和实际响应。</p>
+        <div id="logStatus" class="activity-status" role="status"></div>
+        <div class="activity-scroll"><table>
+            <thead><tr><th>时间</th><th>客户端</th><th>工具 / 数据源</th><th>结果</th><th>耗时</th></tr></thead>
+            <tbody id="logRows"><tr><td colspan="5">加载中…</td></tr></tbody>
+        </table></div>
+        <div class="activity-toolbar" style="margin-top:16px;margin-bottom:0">
+            <button class="btn-ghost" id="logPrev" onclick="changeLogPage(-1)">上一页</button>
+            <span id="logPage">第 1 页</span>
+            <button class="btn-ghost" id="logNext" onclick="changeLogPage(1)">下一页</button>
+        </div>
+    </div>
+
+    <dialog id="approvalDialog" aria-labelledby="approvalTitle">
+        <h2 id="approvalTitle">有 SQL 等待确认</h2>
+        <p class="activity-note">请核对客户端、数据源和完整 SQL 后，再批准执行。</p>
+        <div id="dialogRequests"></div>
+        <button class="btn-ghost" onclick="document.getElementById('approvalDialog').close()">稍后处理</button>
+    </dialog>
 
     <div class="card">
         <h2>数据源配置 <button class="btn-ghost" style="float:right;padding:4px 14px;font-size:13px;" onclick="loadList()">刷新</button></h2>
@@ -169,6 +222,7 @@
     </div>
 </div>
 
+<script src="/sql-notifications.js"></script>
 <script>
     const API = '/api/datasources';
     const TOKEN_KEY = 'dameng_mcp_access_token';
@@ -189,6 +243,8 @@
         localStorage.setItem(TOKEN_KEY, token());
         showMsg('令牌已应用，正在刷新列表...', true);
         loadList();
+        pollConfirmation();
+        loadLogs(true);
     }
 
     function headers() {
@@ -429,10 +485,136 @@
         }
     }
 
+    let logPage = 0;
+    let logsLoading = false;
+    let confirmationPolling = false;
+    let modeSaving = false;
+    let pendingSignature = null;
+    const notifiedApprovals = new Set();
+    const sqlNotifications = new SqlApprovalNotifications(
+        document.getElementById('browserNotificationButton'),
+        document.getElementById('browserNotificationStatus'),
+        async id => {
+            window.focus();
+            document.getElementById('sqlConfirmation').scrollIntoView({behavior: 'smooth'});
+            await pollConfirmation();
+            if (notifiedApprovals.has(id)) {
+                const dialog = document.getElementById('approvalDialog');
+                if (!dialog.open) dialog.showModal();
+            }
+        },
+        () => pollConfirmation()
+    );
+    window.addEventListener('pagehide', () => sqlNotifications.close());
+
+    async function activityApi(path, method = 'GET', data) {
+        const res = await fetch('/api/activity' + path, {method, headers: headers(),
+            body: data === undefined ? undefined : JSON.stringify(data)});
+        const json = await res.json();
+        if (!res.ok || !json.success) throw new Error(json.message || json.detail || '请求失败（' + res.status + '）');
+        return json.data;
+    }
+    function approvalMarkup(items) {
+        return items.map(item => `<div class="pending-item">
+            <strong>${esc(item.client)} · ${esc(item.datasource)}</strong>
+            <div class="activity-note">${esc(item.tool)} · 截止 ${esc(new Date(item.expiresAt).toLocaleString())}</div>
+            <pre class="activity-pre">${esc(item.sql)}</pre>
+            <button class="btn-primary" data-approval="${encodeURIComponent(item.id)}" data-approved="true">批准执行</button>
+            <button class="btn-danger" data-approval="${encodeURIComponent(item.id)}" data-approved="false">拒绝</button>
+        </div>`).join('');
+    }
+    async function pollConfirmation() {
+        if (confirmationPolling || modeSaving) return;
+        confirmationPolling = true;
+        try {
+            const data = await activityApi('/confirmation');
+            const checkbox = document.getElementById('confirmationMode');
+            checkbox.checked = data.enabled;
+            checkbox.disabled = false;
+            document.getElementById('pendingBadge').textContent = data.pending.length + ' 条待确认';
+            const signature = JSON.stringify(data.pending);
+            if (signature !== pendingSignature) {
+                document.getElementById('pendingRequests').innerHTML = approvalMarkup(data.pending) || '<p class="activity-note">暂无待确认 SQL</p>';
+                document.getElementById('dialogRequests').innerHTML = approvalMarkup(data.pending);
+                pendingSignature = signature;
+            }
+            document.getElementById('approvalStatus').textContent = '';
+            const newItems = data.pending.filter(item => !notifiedApprovals.has(item.id));
+            const dialog = document.getElementById('approvalDialog');
+            if (newItems.length && !dialog.open) dialog.showModal();
+            newItems.forEach(item => notifiedApprovals.add(item.id));
+            const activeIds = new Set(data.pending.map(item => item.id));
+            sqlNotifications.sync(data.pending);
+            for (const id of notifiedApprovals) if (!activeIds.has(id)) notifiedApprovals.delete(id);
+            if (!data.pending.length && dialog.open) dialog.close();
+        } catch (e) {
+            document.getElementById('approvalStatus').textContent = '确认队列加载失败：' + e.message;
+            document.getElementById('confirmationMode').disabled = true;
+            document.getElementById('pendingRequests').textContent = '';
+            pendingSignature = null;
+            document.getElementById('approvalDialog').close();
+        } finally { confirmationPolling = false; }
+    }
+    async function changeConfirmationMode() {
+        const checkbox = document.getElementById('confirmationMode');
+        const desired = checkbox.checked;
+        modeSaving = true;
+        checkbox.disabled = true;
+        try { await activityApi('/confirmation', 'PUT', {enabled: desired}); }
+        catch(e) { checkbox.checked = !desired; document.getElementById('approvalStatus').textContent = e.message; }
+        finally { modeSaving = false; checkbox.disabled = false; }
+    }
+    document.addEventListener('click', async event => {
+        const button = event.target.closest('[data-approval]');
+        if (!button || button.disabled) return;
+        const id = button.dataset.approval;
+        document.querySelectorAll('[data-approval="' + id + '"]').forEach(b => b.disabled = true);
+        try {
+            await activityApi('/confirmation/' + id, 'POST', {approved: button.dataset.approved === 'true'});
+            await pollConfirmation();
+            await loadLogs(true);
+        } catch(e) {
+            document.getElementById('approvalDialog').close();
+            await pollConfirmation();
+            document.getElementById('approvalStatus').textContent = e.message;
+        }
+    });
+    async function loadLogs(reset = false) {
+        if (logsLoading) return;
+        if (reset) logPage = 0;
+        logsLoading = true;
+        try {
+            const detail = document.getElementById('logView').value === 'detail';
+            const date = document.getElementById('logDate').value;
+            const data = await activityApi('/logs?' + new URLSearchParams({date, page: logPage, size: 20, detail}));
+            document.getElementById('logRows').innerHTML = data.items.map(item => {
+                const failed = item.status !== 'ok';
+                let row = `<tr><td>${esc(new Date(item.time).toLocaleString())}</td>
+                    <td>${esc(item.client)}<br><small>${esc(item.clientVersion)}</small></td>
+                    <td>${esc(item.tool)}<br><small>${esc(item.datasource || '—')}</small></td>
+                    <td><span class="tag ${failed ? 'tag-yes' : 'tag-no'}">${failed ? '失败' : '成功'}</span>${item.error ? '<div class="status-error">' + esc(item.error.code) + ' · ' + esc(item.error.message) + '</div>' : ''}</td>
+                    <td>${esc(item.durationMs)} ms</td></tr>`;
+                if (detail) row += `<tr><td colspan="5"><details open><summary>请求 / SQL</summary><pre class="activity-pre">${esc(JSON.stringify(item.request, null, 2))}</pre></details>
+                    <details><summary>响应</summary><pre class="activity-pre">${esc(JSON.stringify(item.response, null, 2))}</pre></details></td></tr>`;
+                return row;
+            }).join('') || '<tr><td colspan="5">当天暂无调用日志</td></tr>';
+            document.getElementById('logPage').textContent = '第 ' + (logPage + 1) + ' 页';
+            document.getElementById('logPrev').disabled = logPage === 0;
+            document.getElementById('logNext').disabled = !data.hasMore;
+            document.getElementById('logStatus').textContent = '';
+        } catch(e) { document.getElementById('logStatus').textContent = '日志加载失败：' + e.message; }
+        finally { logsLoading = false; }
+    }
+    function changeLogPage(delta) { if (!logsLoading) { logPage = Math.max(0, logPage + delta); loadLogs(); } }
+    const today = new Date();
+    document.getElementById('logDate').value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
     initToken();
     initMcpUrl();
     toggleFields();
     loadList();
+    pollConfirmation();
+    loadLogs();
+    setInterval(pollConfirmation, 2000);
 </script>
 </body>
 </html>

@@ -3,6 +3,11 @@ package com.dameng.mcp.config;
 import com.dameng.mcp.model.mcp.ToolException;
 import com.dameng.mcp.model.mcp.ToolResponse;
 import com.dameng.mcp.util.ConnectionError;
+import com.dameng.mcp.adapter.DataSourceRegistry;
+import com.dameng.mcp.service.McpCallLogService;
+import com.dameng.mcp.service.SqlApprovalService;
+import com.dameng.mcp.security.SqlSecurityValidator;
+import io.modelcontextprotocol.server.McpSyncServerExchange;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.server.McpServerFeatures;
@@ -22,10 +27,24 @@ public class McpToolSpecFactory {
 
     private final ObjectMapper objectMapper;
     private final McpToolProperties properties;
+    private McpCallLogService callLogs;
+    private SqlApprovalService approvals;
+    private DataSourceRegistry registry;
+    private SqlSecurityValidator validator;
 
     public McpToolSpecFactory(ObjectMapper objectMapper, McpToolProperties properties) {
         this.objectMapper = objectMapper;
         this.properties = properties;
+    }
+
+    public McpToolSpecFactory(ObjectMapper mapper, McpToolProperties properties,
+                              McpCallLogService logs, SqlApprovalService approvals,
+                              DataSourceRegistry registry, SqlSecurityValidator validator) {
+        this(mapper, properties);
+        this.callLogs = logs;
+        this.approvals = approvals;
+        this.registry = registry;
+        this.validator = validator;
     }
 
     public McpServerFeatures.SyncToolSpecification create(
@@ -36,6 +55,21 @@ public class McpToolSpecFactory {
             Map<String, Object> dataSchema,
             boolean readOnly,
             Handler handler) {
+        return create(name, title, description, inputSchema, dataSchema,
+                readOnly, !readOnly, readOnly, true, handler);
+    }
+
+    public McpServerFeatures.SyncToolSpecification create(
+            String name,
+            String title,
+            String description,
+            McpSchema.JsonSchema inputSchema,
+            Map<String, Object> dataSchema,
+            boolean readOnly,
+            boolean destructive,
+            boolean idempotent,
+            boolean openWorld,
+            Handler handler) {
         McpSchema.Tool tool = McpSchema.Tool.builder()
                 .name(name)
                 .title(title)
@@ -43,13 +77,74 @@ public class McpToolSpecFactory {
                 .inputSchema(inputSchema)
                 .outputSchema(outputSchema(dataSchema))
                 .annotations(new McpSchema.ToolAnnotations(
-                        title, readOnly, !readOnly, readOnly, true, false))
+                        title, readOnly, destructive, idempotent, openWorld, false))
                 .build();
 
         return McpServerFeatures.SyncToolSpecification.builder()
                 .tool(tool)
-                .callHandler((exchange, request) -> invoke(handler, request.arguments()))
+                .callHandler((exchange, request) -> invokeLogged(name, readOnly, exchange, handler, request.arguments()))
                 .build();
+    }
+
+    private McpSchema.CallToolResult invokeLogged(String name, boolean readOnly, McpSyncServerExchange exchange,
+                                                 Handler handler, Map<String, Object> arguments) {
+        String id = java.util.UUID.randomUUID().toString();
+        String startedAt = java.time.Instant.now().toString();
+        long start = System.nanoTime();
+        String client = exchange == null || exchange.getClientInfo() == null ? "unknown" : exchange.getClientInfo().name();
+        String version = exchange == null || exchange.getClientInfo() == null ? "" : exchange.getClientInfo().version();
+        Map<String, Object> args = new LinkedHashMap<>(arguments == null ? Map.of() : arguments);
+        // Resolve and pin defaults once, including while waiting for SQL approval.
+        if (registry != null && (args.get("datasource") == null || args.get("datasource").toString().isBlank())) {
+            String resolved = null;
+            if (name.startsWith("db_")) resolved = registry.getDefaultName();
+            else {
+                String type = name.startsWith("es_") ? "elasticsearch" : name.startsWith("redis_") ? "redis"
+                        : name.startsWith("kafka_") ? "kafka" : "";
+                resolved = registry.listDataSources().stream().filter(d -> type.equals(d.getType()))
+                        .map(d -> d.getName()).findFirst().orElse(null);
+            }
+            if (resolved != null && !resolved.isBlank()) args.put("datasource", resolved);
+        }
+        String datasource = String.valueOf(args.getOrDefault("datasource", ""));
+        McpSchema.CallToolResult result = invoke(effective -> {
+            if (approvals != null && !readOnly && name.startsWith("db_")) {
+                Object sqlValue = effective.get("sql");
+                if (!(sqlValue instanceof String sql) || sql.isBlank()) throw new IllegalArgumentException("sql 不能为空");
+                if (name.equals("db_execute_sql")) validator.validateDdl(sql);
+                else {
+                    String cleaned = validator.validateWrite(sql);
+                    String expected = name.substring(3).toUpperCase(java.util.Locale.ROOT);
+                    if (!cleaned.toUpperCase(java.util.Locale.ROOT).startsWith(expected)) {
+                        throw new IllegalArgumentException("当前工具仅支持 " + expected + " 语句");
+                    }
+                }
+                var approvedAdapter = registry.getAdapter(datasource);
+                if (registry.isReadonly(datasource)) throw new SecurityException("数据源为只读模式，不允许修改");
+                approvals.await(id, client, name, datasource, sql);
+                if (registry.getAdapter(datasource) != approvedAdapter) {
+                    throw new ToolException("DATASOURCE_CHANGED", "等待确认期间数据源配置发生变化，SQL 未执行，请重新发起请求");
+                }
+            }
+            return handler.handle(effective);
+        }, args);
+        if (callLogs != null) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("id", id);
+            entry.put("time", startedAt);
+            entry.put("completedAt", java.time.Instant.now().toString());
+            entry.put("client", client);
+            entry.put("clientVersion", version);
+            entry.put("tool", name);
+            entry.put("datasource", datasource);
+            entry.put("durationMs", (System.nanoTime() - start) / 1_000_000L);
+            entry.put("status", Boolean.TRUE.equals(result.isError()) ? "error" : "ok");
+            if (result.structuredContent() instanceof Map<?, ?> structured) entry.put("error", structured.get("error"));
+            entry.put("request", args);
+            entry.put("response", result.structuredContent() == null ? result.content() : result.structuredContent());
+            callLogs.append(entry);
+        }
+        return result;
     }
 
     private McpSchema.CallToolResult invoke(Handler handler, Map<String, Object> arguments) {

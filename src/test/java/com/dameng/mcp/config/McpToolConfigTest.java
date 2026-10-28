@@ -5,6 +5,7 @@ import com.dameng.mcp.service.DatabaseQueryService;
 import com.dameng.mcp.service.DatabaseStatisticsService;
 import com.dameng.mcp.service.DatabaseWriteService;
 import com.dameng.mcp.service.ElasticsearchToolService;
+import com.dameng.mcp.service.ElasticsearchExportService;
 import com.dameng.mcp.service.KafkaToolService;
 import com.dameng.mcp.service.RedisToolService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -32,7 +33,7 @@ class McpToolConfigTest {
     }
 
     @Test
-    void registersOnlyTheTwentyEightV3ToolsWithSchemasAndAnnotations() {
+    void registersOnlyTheThirtyTwoV3ToolsWithSchemasAndAnnotations() {
         McpToolConfig config = new McpToolConfig();
         McpToolProperties properties = new McpToolProperties();
         ObjectMapper mapper = new ObjectMapper();
@@ -42,16 +43,18 @@ class McpToolConfigTest {
                 factory, properties, mapper,
                 mock(DatabaseMetadataService.class), mock(DatabaseQueryService.class),
                 mock(DatabaseStatisticsService.class), mock(DatabaseWriteService.class),
-                mock(ElasticsearchToolService.class), mock(RedisToolService.class),
+                mock(ElasticsearchToolService.class), mock(ElasticsearchExportService.class),
+                mock(RedisToolService.class),
                 mock(KafkaToolService.class));
 
         Set<String> names = tools.stream().map(tool -> tool.tool().name()).collect(Collectors.toSet());
-        assertThat(tools).hasSize(28);
+        assertThat(tools).hasSize(32);
         assertThat(names).containsExactlyInAnyOrder(
                 "datasource_list", "db_list_schemas", "db_list_tables", "db_describe_table",
                 "db_query", "db_sample_rows", "db_table_statistics", "db_column_statistics",
                 "db_insert", "db_update", "db_delete", "db_execute_sql",
                 "es_list_indices", "es_get_mapping", "es_count_documents", "es_search",
+                "es_start_export", "es_get_export_status", "es_list_exports", "es_cancel_export",
                 "es_index_document", "es_delete_document", "redis_scan_keys", "redis_get_key_info",
                 "redis_get_value", "redis_set_value", "redis_delete_key", "redis_set_expiry",
                 "kafka_list_topics", "kafka_describe_topic", "kafka_list_consumer_groups",
@@ -67,10 +70,14 @@ class McpToolConfigTest {
         assertThat(tool(tools, "db_query").tool().annotations().destructiveHint()).isFalse();
         assertThat(tool(tools, "db_delete").tool().annotations().readOnlyHint()).isFalse();
         assertThat(tool(tools, "db_delete").tool().annotations().destructiveHint()).isTrue();
+        assertThat(tool(tools, "es_start_export").tool().annotations().readOnlyHint()).isFalse();
+        assertThat(tool(tools, "es_start_export").tool().annotations().destructiveHint()).isFalse();
+        assertThat(tool(tools, "es_start_export").tool().annotations().idempotentHint()).isFalse();
         assertDataProperty(tool(tools, "datasource_list"), "items");
         assertDataProperty(tool(tools, "db_query"), "rows");
         assertDataProperty(tool(tools, "db_update"), "affected_rows");
         assertDataProperty(tool(tools, "es_search"), "hits");
+        assertDataProperty(tool(tools, "es_get_export_status"), "rows_written");
         assertDataProperty(tool(tools, "redis_get_value"), "value");
         assertDataProperty(tool(tools, "kafka_peek_messages"), "messages");
     }

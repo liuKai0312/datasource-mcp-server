@@ -83,6 +83,39 @@ public class ElasticsearchRestClient implements AutoCloseable {
     }
 
     /**
+     * Open a point-in-time snapshot for stable search_after pagination.
+     */
+    public String openPointInTime(String index, String keepAlive) {
+        JsonNode result = performRequest("POST", "/" + encodePathSegment(index)
+                + "/_pit?keep_alive=" + keepAlive, null);
+        String id = result.path("id").asText();
+        if (id.isBlank()) {
+            throw new IllegalStateException("Elasticsearch 未返回 PIT id");
+        }
+        return id;
+    }
+
+    /**
+     * Search within a PIT. The body must include pit, sort and optional search_after.
+     */
+    public JsonNode searchPointInTime(String jsonDsl) {
+        return performRequest("POST", "/_search", jsonDsl);
+    }
+
+    /**
+     * Close a point-in-time snapshot. Closing a missing/expired PIT is harmless to callers.
+     */
+    public JsonNode closePointInTime(String pitId) {
+        try {
+            return performRequest("DELETE", "/_pit",
+                    MAPPER.createObjectNode().put("id", pitId).toString());
+        } catch (RuntimeException e) {
+            log.warn("关闭 Elasticsearch PIT 失败: {}", e.getMessage());
+            return MAPPER.createObjectNode();
+        }
+    }
+
+    /**
      * 写入/更新文档。id 为空时由 ES 自动生成（POST /{index}/_doc）。
      */
     public JsonNode indexDocument(String index, String id, String jsonDoc) {

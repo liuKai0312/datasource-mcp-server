@@ -152,7 +152,7 @@ public class DatabaseWriteService {
                 && !securityValidator.hasWhereClause(cleaned);
         List<String> warnings = unsafeScope
                 ? List.of(statementType + " 语句未包含 WHERE 条件，将影响全表数据；本服务按配置继续执行。")
-                : List.of("该工具会直接执行任意单条 SQL，客户端确认并非服务端强制安全边界。");
+                : List.of("该工具可修改数据库结构或权限，请谨慎执行。");
         auditBefore(statementType, resolvedName, cleaned, unsafeScope);
         long start = System.currentTimeMillis();
         try {
