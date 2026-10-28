@@ -99,7 +99,7 @@
         <h2>SQL 执行确认 <span id="pendingBadge" class="tag tag-builtin">连接中</span></h2>
         <div class="activity-toolbar">
             <label><input type="checkbox" id="confirmationMode" disabled onchange="changeConfirmationMode()">修改 SQL 执行前需手动确认</label>
-            <button class="btn-ghost" onclick="pollConfirmation()">刷新待确认请求</button>
+            <span class="activity-note">每 2 秒自动刷新请求</span>
             <button class="btn-ghost" id="browserNotificationButton">开启浏览器通知</button>
         </div>
         <p id="browserNotificationStatus" class="activity-note" role="status"></p>
@@ -113,7 +113,7 @@
         <div class="activity-toolbar">
             <label>日期 <input type="date" id="logDate" onchange="loadLogs(true)"></label>
             <label>展示 <select id="logView" onchange="loadLogs(true)"><option value="summary">简略</option><option value="detail">详细 · 请求与响应</option></select></label>
-            <button class="btn-ghost" onclick="loadLogs(true)">刷新日志</button>
+            <span class="activity-note">每 2 秒自动刷新日志</span>
         </div>
         <p class="activity-note">调用完成后写入本机文件，包含客户端、数据源、执行结果与耗时；详细视图显示请求参数（含 SQL）和实际响应。</p>
         <div id="logStatus" class="activity-status" role="status"></div>
@@ -487,6 +487,8 @@
 
     let logPage = 0;
     let logsLoading = false;
+    let logsReloadPending = false;
+    let logSignature = null;
     let confirmationPolling = false;
     let modeSaving = false;
     let pendingSignature = null;
@@ -508,11 +510,15 @@
     window.addEventListener('pagehide', () => sqlNotifications.close());
 
     async function activityApi(path, method = 'GET', data) {
-        const res = await fetch('/api/activity' + path, {method, headers: headers(),
-            body: data === undefined ? undefined : JSON.stringify(data)});
-        const json = await res.json();
-        if (!res.ok || !json.success) throw new Error(json.message || json.detail || '请求失败（' + res.status + '）');
-        return json.data;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+            const res = await fetch('/api/activity' + path, {method, headers: headers(), signal: controller.signal,
+                body: data === undefined ? undefined : JSON.stringify(data)});
+            const json = await res.json();
+            if (!res.ok || !json.success) throw new Error(json.message || json.detail || '请求失败（' + res.status + '）');
+            return json.data;
+        } finally { clearTimeout(timeout); }
     }
     function approvalMarkup(items) {
         return items.map(item => `<div class="pending-item">
@@ -572,7 +578,7 @@
         try {
             await activityApi('/confirmation/' + id, 'POST', {approved: button.dataset.approved === 'true'});
             await pollConfirmation();
-            await loadLogs(true);
+            await loadLogs();
         } catch(e) {
             document.getElementById('approvalDialog').close();
             await pollConfirmation();
@@ -580,30 +586,51 @@
         }
     });
     async function loadLogs(reset = false) {
-        if (logsLoading) return;
         if (reset) logPage = 0;
+        if (logsLoading) { if (reset) logsReloadPending = true; return; }
         logsLoading = true;
+        const requestedPage = logPage;
+        const requestedDate = document.getElementById('logDate').value;
+        const requestedView = document.getElementById('logView').value;
         try {
             const detail = document.getElementById('logView').value === 'detail';
             const date = document.getElementById('logDate').value;
             const data = await activityApi('/logs?' + new URLSearchParams({date, page: logPage, size: 20, detail}));
-            document.getElementById('logRows').innerHTML = data.items.map(item => {
+            // A filter changed while this request was in flight: wait for its queued refresh.
+            if (requestedPage !== logPage || requestedDate !== document.getElementById('logDate').value
+                || requestedView !== document.getElementById('logView').value) return;
+            const signature = JSON.stringify({data, detail});
+            document.getElementById('logStatus').textContent = '';
+            if (signature === logSignature) return;
+            const rows = document.getElementById('logRows');
+            const expanded = new Map(Array.from(rows.querySelectorAll('details[data-log-id]'), el =>
+                [el.dataset.logId + ':' + el.dataset.section, {open: el.open,
+                    scrollTop: el.querySelector('pre').scrollTop}]));
+            rows.innerHTML = data.items.map(item => {
                 const failed = item.status !== 'ok';
                 let row = `<tr><td>${esc(new Date(item.time).toLocaleString())}</td>
                     <td>${esc(item.client)}<br><small>${esc(item.clientVersion)}</small></td>
                     <td>${esc(item.tool)}<br><small>${esc(item.datasource || '—')}</small></td>
                     <td><span class="tag ${failed ? 'tag-yes' : 'tag-no'}">${failed ? '失败' : '成功'}</span>${item.error ? '<div class="status-error">' + esc(item.error.code) + ' · ' + esc(item.error.message) + '</div>' : ''}</td>
                     <td>${esc(item.durationMs)} ms</td></tr>`;
-                if (detail) row += `<tr><td colspan="5"><details open><summary>请求 / SQL</summary><pre class="activity-pre">${esc(JSON.stringify(item.request, null, 2))}</pre></details>
-                    <details><summary>响应</summary><pre class="activity-pre">${esc(JSON.stringify(item.response, null, 2))}</pre></details></td></tr>`;
+                if (detail) row += `<tr><td colspan="5"><details open data-log-id="${encodeURIComponent(item.id)}" data-section="request"><summary>请求 / SQL</summary><pre class="activity-pre">${esc(JSON.stringify(item.request, null, 2))}</pre></details>
+                    <details data-log-id="${encodeURIComponent(item.id)}" data-section="response"><summary>响应</summary><pre class="activity-pre">${esc(JSON.stringify(item.response, null, 2))}</pre></details></td></tr>`;
                 return row;
             }).join('') || '<tr><td colspan="5">当天暂无调用日志</td></tr>';
+            rows.querySelectorAll('details[data-log-id]').forEach(el => {
+                const previous = expanded.get(el.dataset.logId + ':' + el.dataset.section);
+                if (previous) { el.open = previous.open; el.querySelector('pre').scrollTop = previous.scrollTop; }
+            });
+            logSignature = signature;
             document.getElementById('logPage').textContent = '第 ' + (logPage + 1) + ' 页';
             document.getElementById('logPrev').disabled = logPage === 0;
             document.getElementById('logNext').disabled = !data.hasMore;
             document.getElementById('logStatus').textContent = '';
         } catch(e) { document.getElementById('logStatus').textContent = '日志加载失败：' + e.message; }
-        finally { logsLoading = false; }
+        finally {
+            logsLoading = false;
+            if (logsReloadPending) { logsReloadPending = false; loadLogs(); }
+        }
     }
     function changeLogPage(delta) { if (!logsLoading) { logPage = Math.max(0, logPage + delta); loadLogs(); } }
     const today = new Date();
@@ -614,7 +641,15 @@
     loadList();
     pollConfirmation();
     loadLogs();
-    setInterval(pollConfirmation, 2000);
+    function refreshActivity() {
+        pollConfirmation();
+        loadLogs();
+    }
+    setInterval(refreshActivity, 2000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshActivity();
+    });
+    window.addEventListener('focus', refreshActivity);
 </script>
 </body>
 </html>
